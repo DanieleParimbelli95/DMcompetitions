@@ -1,0 +1,434 @@
+---
+title: "Ames house prices"
+output: html_document
+---
+
+NAME: Daniele Parimbelli
+
+BADGE: 790212
+
+NICKNAME: d.parimbelli2
+
+TEAM: d.parimbelli2
+
+ROUND: 1st
+
+### Summary
+
+La mia strategia è stata
+
+1. trattare i dati mancanti variabile per variabile
+2. considerare le variabili ordinali come numeriche
+3. creare nuove variabili che potessero essere utili nella previsione della risposta
+4. rimuovere alcune variabili poco significative o troppo correlate con altre già presenti
+5. xgboost
+6. one hot encoding per le variabili factor
+7. eliminare le variabili con varianza prossima allo zero
+8. lasso
+9. ridge
+10. media pesata tra le previsioni
+
+### References:
+
+* Il kernel [House prices: Lasso, XGBoost, and a detailed EDA](https://www.kaggle.com/erikbruin/house-prices-lasso-xgboost-and-a-detailed-eda) come fonte d'ispirazione
+
+* Per il tuning degli iperparametri della xgboost https://xgboost.readthedocs.io/en/latest/index.html e https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/
+
+* Guida al pacchetto caret di Max Kuhn: http://topepo.github.io/caret/index.html
+
+### Models
+
+* Xgboost, Lasso, Ridge
+
+### Non-standard R packages
+
+* 
+
+```{r startup, include = FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = T, eval=T, message=F, warning=F, error=F, comment=NA, cache=F, R.options=list(width=220))
+```
+
+
+### R code to reproduce the last submission:
+
+```{r}
+# pacchetti di R
+library(readr)
+library(dplyr)
+library(caret)
+library(glmnet)
+
+# importazione dei dati
+train <- read.csv("http://bee-fore.s3-eu-west-1.amazonaws.com/datasets/60.csv", stringsAsFactors=T)
+test <- read.csv("http://bee-fore.s3-eu-west-1.amazonaws.com/datasets/61.csv", stringsAsFactors=T)
+
+n<-nrow(train)
+m<-nrow(test)
+
+test$SalePrice = NA
+
+# unione train e test per il preprocessing dei dati
+combi = rbind(train, test)
+
+
+# PREPROCESSING 
+
+# la variabile MS.SubClass è in realtà di tipo factor
+combi$MS.SubClass<-as.factor(combi$MS.SubClass)
+
+# sostituzione ai dati mancanti di Lot.Frontage dei valori medi o mediani, in base al quartiere di
+# appartenenza della casa
+for (i in 1:nrow(combi)){
+  if(is.na(combi$Lot.Frontage[i])){
+    combi$Lot.Frontage[i] <- as.integer(median(combi$Lot.Frontage[combi$Neighborhood==combi$Neighborhood[i]], na.rm=TRUE)) 
+  }
+}
+
+for (i in 1:nrow(combi)){
+  if(is.na(combi$Lot.Frontage[i])){
+    combi$Lot.Frontage[i] <- as.integer(mean(combi$Lot.Frontage, na.rm=TRUE)) 
+  }
+}
+
+# considero la variabile Street come ordinale e quindi la trasformo in integer
+combi$Street<-factor(combi$Street, levels=c("Grvl","Pave"))
+combi$Street<-as.integer(combi$Street)
+
+# ho interpretato i dati mancanti come indici di assenza del vialetto
+combi$Alley<-as.character(combi$Alley)
+combi$Alley[is.na(combi$Alley)]<- "No Alley"
+combi$Alley<-as.factor(combi$Alley)
+
+# considero la variabile Lot.Shape come ordinale e quindi la trasformo in integer
+combi$Lot.Shape<-factor(combi$Lot.Shape, levels=c("IR3","IR2","IR1","Reg"))
+combi$Lot.Shape<-as.integer(combi$Lot.Shape)
+
+# considero la variabile Land.Slope come ordinale e quindi la trasformo in integer
+combi$Land.Slope<-factor(combi$Land.Slope, levels=c("Sev","Mod","Gtl"))
+combi$Land.Slope<-as.integer(combi$Land.Slope)
+
+# creazione di due nuove variabili ordinali per indicare il periodo di costruzione e di rimodellamento (divisioni effettuate con l'ausiliio di un albero di regressione)
+combi$New.Year.Built[combi$Year.Built<1959]=1
+combi$New.Year.Built[combi$Year.Built>=1959 & combi$Year.Built<1987]=2  
+combi$New.Year.Built[combi$Year.Built>=1987 & combi$Year.Built<2005]=3
+combi$New.Year.Built[combi$Year.Built>=2005]=4
+
+combi$New.Year.Remod.Add[combi$Year.Remod.Add<1956]=1
+combi$New.Year.Remod.Add[combi$Year.Remod.Add>=1956 & combi$Year.Remod.Add<1986]=2  
+combi$New.Year.Remod.Add[combi$Year.Remod.Add>=1986 & combi$Year.Remod.Add<2006]=3
+combi$New.Year.Remod.Add[combi$Year.Remod.Add>=2006]=4
+
+# ho interpretato i dati mancanti come assenza
+combi$Mas.Vnr.Type[combi$Mas.Vnr.Type==""]=NA
+combi$Mas.Vnr.Type[is.na(combi$Mas.Vnr.Type)]= "None"   
+combi$Mas.Vnr.Area[is.na(combi$Mas.Vnr.Area)]<- 0
+
+# considero le variabili Exter.Qual e Exter.Cond come ordinali e quindi le trasformo in integer
+combi$Exter.Qual<-factor(combi$Exter.Qual, levels=c("Po","Fa","TA","Gd","Ex"))
+combi$Exter.Qual<-as.integer(combi$Exter.Qual)
+combi$Exter.Cond<-factor(combi$Exter.Cond, levels=c("Po","Fa","TA","Gd","Ex"))
+combi$Exter.Cond<-as.integer(combi$Exter.Cond)
+
+# nelle seguenti variabili relative al basement considero i dati mancanti come assenza
+# quelle ordinali le trasformo in integer
+combi$Bsmt.Qual<-as.character(combi$Bsmt.Qual)
+combi$Bsmt.Qual[combi$Bsmt.Qual==""]=NA 
+combi$Bsmt.Qual[is.na(combi$Bsmt.Qual)]<- "No Basement"
+combi$Bsmt.Qual<-factor(combi$Bsmt.Qual, levels=c("No Basement","Po","Fa","TA","Gd","Ex"))
+combi$Bsmt.Qual<-as.integer(combi$Bsmt.Qual)
+
+combi$Bsmt.Cond<-as.character(combi$Bsmt.Cond)
+combi$Bsmt.Cond[combi$Bsmt.Cond==""]=NA
+combi$Bsmt.Cond[is.na(combi$Bsmt.Cond)]<- "No Basement"
+combi$Bsmt.Cond<-factor(combi$Bsmt.Cond, levels=c("No Basement","Po","Fa","TA","Gd","Ex"))
+combi$Bsmt.Cond<-as.integer(combi$Bsmt.Cond)
+
+combi$Bsmt.Exposure<-as.character(combi$Bsmt.Exposure)
+combi$Bsmt.Exposure[combi$Bsmt.Exposure==""]=NA  
+combi$Bsmt.Exposure[is.na(combi$Bsmt.Exposure)]<- "No Basement"
+combi$Bsmt.Exposure<-factor(combi$Bsmt.Exposure, levels=c("No Basement","No","Mn","Av","Gd"))
+combi$Bsmt.Exposure<-as.integer(combi$Bsmt.Exposure)
+
+combi$BsmtFin.Type.1<-as.character(combi$BsmtFin.Type.1)
+combi$BsmtFin.Type.1[combi$BsmtFin.Type.1==""]=NA
+combi$BsmtFin.Type.1[is.na(combi$BsmtFin.Type.1)]<- "No Basement"
+combi$BsmtFin.Type.1<-factor(combi$BsmtFin.Type.1, levels=c("No Basement","Unf","LwQ","Rec","BLQ","ALQ","GLQ"))
+combi$BsmtFin.Type.1<-as.integer(combi$BsmtFin.Type.1)
+combi$BsmtFin.SF.1[is.na(combi$BsmtFin.SF.1)]<- 0
+
+combi$BsmtFin.Type.2<-as.character(combi$BsmtFin.Type.2)
+combi$BsmtFin.Type.2[combi$BsmtFin.Type.2==""]=NA
+combi$BsmtFin.Type.2[is.na(combi$BsmtFin.Type.2)]<- "No Basement"
+combi$BsmtFin.Type.2<-factor(combi$BsmtFin.Type.2, levels=c("No Basement","Unf","LwQ","Rec","BLQ","ALQ","GLQ"))
+combi$BsmtFin.Type.2<-as.integer(combi$BsmtFin.Type.2)
+
+combi$BsmtFin.SF.2[is.na(combi$BsmtFin.SF.2)]<- 0
+
+combi$Bsmt.Unf.SF[is.na(combi$Bsmt.Unf.SF)]<- 0
+
+combi$Total.Bsmt.SF[is.na(combi$Total.Bsmt.SF)]<- 0
+
+# considero Heting.QC come ordinale e quindi la trasformo in integer
+combi$Heating.QC<-factor(combi$Heating.QC, levels=c("Po","Fa","TA","Gd","Ex"))
+combi$Heating.QC<-as.integer(combi$Heating.QC)
+
+# sostituisco ai valori mancanti di Electrical la moda
+combi$Electrical[combi$Electrical==""]=NA
+combi$Electrical[is.na(combi$Electrical)]= "SBrkr"  
+
+# per le variabili relative al bagno interpreto i dati mancanti come indici di assenza
+combi$Bsmt.Full.Bath[is.na(combi$Bsmt.Full.Bath)]<- 0
+combi$Bsmt.Half.Bath[is.na(combi$Bsmt.Half.Bath)]<- 0
+
+# considero la variabile Kitchen.Qual come ordinale e quindi la trasformo in integer
+combi$Kitchen.Qual<-factor(combi$Kitchen.Qual, levels=c("Po","Fa","TA","Gd","Ex"))
+combi$Kitchen.Qual<-as.integer(combi$Kitchen.Qual)
+
+# considero la variabile Functional come ordinale e quindi la trasformo in integer
+combi$Functional<-factor(combi$Functional, levels=c("Sal","Sev","Maj2","Maj1","Mod", "Min2", "Min1", "Typ"))
+combi$Functional<-as.integer(combi$Functional)
+
+# interpreto i dati mancanti di Fireplace.Qu come indici di assenza
+# inoltre, considero la variabile come ordinale e quindi la trasformo in integer
+combi$Fireplace.Qu<-as.character(combi$Fireplace.Qu)
+combi$Fireplace.Qu[is.na(combi$Fireplace.Qu)]<- "No Fireplace"
+combi$Fireplace.Qu<-factor(combi$Fireplace.Qu, levels=c("No Fireplace","Po","Fa","TA","Gd", "Ex"))
+combi$Fireplace.Qu<-as.integer(combi$Fireplace.Qu)
+
+# interpreto i dati mancanti di Garage.Type come indici di assenza del garage
+combi$Garage.Type<-as.character(combi$Garage.Type)
+combi$Garage.Type[is.na(combi$Garage.Type)]<- "No Garage"
+combi$Garage.Type<-as.factor(combi$Garage.Type)
+
+# considero i dati mancanti di Garage.Yr.Built come indici di assenza del garage
+# inoltre correzione di un chiaro errore
+combi$Garage.Yr.Blt<-as.character(combi$Garage.Yr.Blt)
+combi$Garage.Yr.Blt[is.na(combi$Garage.Yr.Blt)]<- 0 
+combi$Garage.Yr.Blt[combi$Garage.Yr.Blt=="2207"]="2007" 
+
+# creazione di una nuova variabile ordinale per indicare il periodo di costruzione del garage (divisione effettuata con l'ausilio di un albero di regressione)
+combi$New.Garage.Yr.Built[combi$Garage.Yr.Blt<1966]=2
+combi$New.Garage.Yr.Built[combi$Garage.Yr.Blt==0]=1
+combi$New.Garage.Yr.Built[combi$Garage.Yr.Blt>=1966 & combi$Garage.Yr.Blt<1992]=3  
+combi$New.Garage.Yr.Built[combi$Garage.Yr.Blt>=1992 & combi$Garage.Yr.Blt<2005]=4
+combi$New.Garage.Yr.Built[combi$Garage.Yr.Blt>=2005]=5
+
+# interpreto i dati mancanti delle seguenti variabili relative al garage come indici di assenza
+# inoltre considero le variabili Garage.Finish, Garage.Qual e Garage.Cond come ordinali e quindi le trasformo in integer
+combi$Garage.Finish<-as.character(combi$Garage.Finish)
+combi$Garage.Finish[is.na(combi$Garage.Finish)]<- "No Garage"
+combi$Garage.Finish[combi$Garage.Finish==""]="No Garage"
+combi$Garage.Finish<-factor(combi$Garage.Finish, levels=c("No Garage","Unf","RFn","Fin"))
+combi$Garage.Finish<-as.integer(combi$Garage.Finish)
+
+combi$Garage.Cars[is.na(combi$Garage.Cars)]<- 0
+
+combi$Garage.Area[is.na(combi$Garage.Area)]<- 0
+
+combi$Garage.Qual<-as.character(combi$Garage.Qual)
+combi$Garage.Qual[is.na(combi$Garage.Qual)]<- "No Garage"
+combi$Garage.Qual[combi$Garage.Qual==""]="No Garage"
+combi$Garage.Qual<-factor(combi$Garage.Qual, levels=c("No Garage","Po","Fa","TA","Gd", "Ex"))
+combi$Garage.Qual<-as.integer(combi$Garage.Qual)
+
+combi$Garage.Cond<-as.character(combi$Garage.Cond)
+combi$Garage.Cond[is.na(combi$Garage.Cond)]<- "No Garage"
+combi$Garage.Cond[combi$Garage.Cond==""]="No Garage"
+combi$Garage.Cond<-factor(combi$Garage.Cond, levels=c("No Garage","Po","Fa","TA","Gd", "Ex"))
+combi$Garage.Cond<-as.integer(combi$Garage.Cond)
+
+# considero la variabile Paved.Drive come ordinale e quindi la trasformo in integer
+combi$Paved.Drive<-as.character(combi$Paved.Drive)
+combi$Paved.Drive<-factor(combi$Paved.Drive, levels=c("N","P","Y"))
+combi$Paved.Drive<-as.integer(combi$Paved.Drive)
+
+# interpreto i dati mancanti di Pool.QC come indici di assenza della piscina
+# inoltre considero la variabile come ordinale e quindi la trasformo in integer
+combi$Pool.QC<-as.character(combi$Pool.QC)
+combi$Pool.QC[is.na(combi$Pool.QC)]<- "No Pool"
+combi$Pool.QC<-factor(combi$Pool.QC, levels=c("No Pool","Po","Fa","TA","Gd", "Ex"))
+combi$Pool.QC<-as.integer(combi$Pool.QC)
+
+# interpreto i dati mancanti di Fence e Misc.Feature come indici di assenza
+combi$Fence<-as.character(combi$Fence)
+combi$Fence[is.na(combi$Fence)]<- "No Fence"
+combi$Fence<-as.factor(combi$Fence)
+
+combi$Misc.Feature<-as.character(combi$Misc.Feature)
+combi$Misc.Feature[is.na(combi$Misc.Feature)]<- "None"
+combi$Misc.Feature<-as.factor(combi$Misc.Feature)
+
+# le variabili Mo.Sold e Yr.Sold sono segnate come numeriche ma sono in realtà categoriche
+combi$Mo.Sold<-as.factor(combi$Mo.Sold)
+combi$Yr.Sold<-as.factor(combi$Yr.Sold)
+
+
+#FEATURE ENGINEERING
+
+# creazione di una variabile comprensiva di tutti i bagni della casa, dando minor peso ai bagni senza doccia o vasca
+combi$Total.Bath<-combi$Full.Bath+(combi$Half.Bath*0.5)+combi$Bsmt.Full.Bath+(combi$Bsmt.Half.Bath*0.5)
+
+# creazione di una variabile per indicare da quanto tempo era stata costruita una casa quando è stata venduta
+combi$Age<-as.integer(combi$Yr.Sold)-as.integer(combi$Year.Built)
+
+# creazione di una variabile dummy per indicare se una casa era nuova o meno quando è stata venduta
+combi$Is.New<-0
+combi$Is.New[combi$Yr.Sold==combi$Year.Built]<-1
+combi$Is.New<-as.factor(combi$Is.New)
+
+# creazione di una variabile ordinale per raggruppare i quartieri in base al costo delle case (divisione effettuata con l'ausilio dei boxplot e di un albero di regressione)
+combi$New.Neighborhood[combi$Neighborhood %in% c("MeadowV","IDOTRR","BrDale", "BrkSide","OldTown")]<-1
+combi$New.Neighborhood[combi$Neighborhood %in% c("Edwards","Sawyer","Blueste","Mitchel", "NAmes", "NPkVill", "SWISU")]<-2
+combi$New.Neighborhood[combi$Neighborhood %in% c("Blmngtn","ClearCr","CollgCr", "Crawfor", "Gilbert", "Greens","NWAmes","SawyerW","Landmrk")]<-3
+combi$New.Neighborhood[combi$Neighborhood %in% c("Timber", "Veenker", "Somerst")]<-4
+combi$New.Neighborhood[combi$Neighborhood %in% c("NoRidge","NridgHt","StoneBr", "GrnHill")]<-5
+
+# creazione di una variabile che indica l'area totale
+combi$Total.Area<-combi$Total.Bsmt.SF+combi$Gr.Liv.Area
+
+# creazione di una variabile che indica la grandezza media delle stanze della casa
+combi$Average.Room.Size<-(combi$X1st.Flr.SF+combi$X2nd.Flr.SF)/combi$TotRms.AbvGrd
+
+# creazione di due variabili generali
+combi$Exter<-combi$Exter.Cond+combi$Exter.Qual
+combi$Overall<-combi$Overall.Cond+combi$Overall.Qual
+
+# trasformazione di Gr.Liv.Area in una variabile factor (divisione effettuata con l'ausilio di un albero di regressione)
+combi$New.Gr.Liv.Area[combi$Gr.Liv.Area<1186]=1
+combi$New.Gr.Liv.Area[combi$Gr.Liv.Area>=1186 & combi$Gr.Liv.Area<1489]=2  
+combi$New.Gr.Liv.Area[combi$Gr.Liv.Area>=1489 & combi$Gr.Liv.Area<1777]=3  
+combi$New.Gr.Liv.Area[combi$Gr.Liv.Area>=1777 & combi$Gr.Liv.Area<2387]=4
+combi$New.Gr.Liv.Area[combi$Gr.Liv.Area>=2387]=5
+combi$New.Gr.Liv.Area<-as.factor(combi$New.Gr.Liv.Area)
+
+# rimozione di Utilities (varianza zero), le variabili riferite agli anni (troppi livelli), Order e PID 
+combi<-combi[,-c(1,2,11,21,22,61)]
+
+# rimozione delle variabili non importanti o poco importanti, sulla base della feature importance della random forest
+combi2<-combi[,-c(5,12,13,19,33,42,64,65,67,68,70,71,72,73)]
+
+# rimozione delle variabili troppo correlate con altre già presenti
+combi<-combi2[,-c(27,30,37,47,52,54,63,72)]
+
+# rimozione di ulteriori variabili con variabilità minima
+combi<-combi[,-c(27,29,36,53)]
+
+
+# XGBOOST
+
+# ritorno al dataset separato
+train<-combi[1:n,]
+test<-combi[(n+1):(n+m),]
+
+# il processo di tuning dei parametri viene messo come commento perché il software impiega tantissimo tempo a fornire i risultati (più in basso si trova la griglia con i parametri effettivamente utilizzati)
+
+# my_grid<-expand.grid(nrounds=c(200,300,400,500,600), eta=seq(0.01,0.15,by=0.01), max_depth=c(3,4,5,6), gamma=seq(0,1,by=0.1), min_child_weight=c(2,3,4,5), subsample=c(0.7,0.8,0.9,1), colsample_bytree=c(0.7,0.8,0.9,1))
+
+# ctrl <- trainControl(method = "cv",
+#                      number = 5)
+
+# set.seed(457)
+
+# train model
+# fit.xgb <- train(log10(SalePrice) ~ ., 
+#                  train,
+#                  method = "xgbTree",
+#                  trControl=ctrl,
+#                  metric="RMSE",
+#                  preProcess=c("center","scale","BoxCox","zv"),
+#                  tuneGrid=my_grid)
+
+# fit.xgb
+
+# il tuning dei parametri (basato sulla minimizzazione del RMSE) ha portato ad utilizzare la seguente griglia
+my_grid<-expand.grid(nrounds=500, eta=0.04, max_depth=5, gamma=0,
+                     min_child_weight=4, subsample=0.9, colsample_bytree=0.8)
+
+# caret model training parameters
+ctrl <- trainControl(method = "cv",
+                     number = 5)
+
+set.seed(457) # per riproducibilità
+
+# train model
+fit.xgb <- train(log10(SalePrice) ~ ., 
+                 train,
+                 method = "xgbTree",
+                 trControl=ctrl,
+                 metric="RMSE",
+                 preProcess=c("center","scale","BoxCox","zv"), # standardizzazione, correzione asimmetrie e rimozione di eventuali ulteriori variabili a varianza zero
+                 tuneGrid=my_grid)
+
+# previsioni xgboost
+yhat_xgb=10^predict(fit.xgb, newdata=test)
+
+
+# one hot encoding delle variabili factor con la funzione di caret DummyVars
+dummies <- dummyVars(~., combi)
+combi.with.dummies <- data.frame(predict(dummies, combi))
+
+# variabili con varianza prossima allo zero (freqCut fissato in modo da rimuovere le variabili con all'incirca 10 o meno osservazioni)
+vars_zv = nearZeroVar(combi.with.dummies, freqCut = 400/1, uniqueCut = 10)
+
+# eliminazione delle variabili con varianza prossima allo zero
+combi.with.dummies<-combi.with.dummies[,-vars_zv]
+
+# ritorno al dataset separato
+train<-combi.with.dummies[1:n,]
+test<-combi.with.dummies[(n+1):(n+m),]
+
+
+# LASSO
+
+# caret model training parameters
+ctrl <- trainControl(method = "cv",
+                     number = 5)
+
+set.seed(457) # per riproducibilità
+
+# train model
+fit.lasso <- train(log10(SalePrice) ~ ., 
+                   train,
+                   method = "glmnet",
+                   trControl=ctrl,
+                   metric="RMSE",
+                   preProcess=c("center","scale","BoxCox","zv"), # standardizzazione, correzione asimmetrie e rimozione variabili a varianza zero
+                   tuneGrid=expand.grid(alpha=1,lambda=seq(0.001, 0.1, by = 0.001)))
+
+# previsioni lasso
+yhat_lasso = 10^predict(fit.lasso, newdata=test)
+
+
+# RIDGE
+
+# caret model training parameters
+ctrl <- trainControl(method = "cv",
+                     number = 5)
+
+set.seed(457) # per riproducibilità
+
+# train model
+fit.ridge <- train(log10(SalePrice) ~ ., 
+                   train,
+                   method = "glmnet",
+                   trControl=ctrl,
+                   preProcess=c("center","scale","BoxCox","zv"), # standardizzazione, correzione asimmetrie e rimozione variabili a varianza zero
+                   metric="RMSE",
+                   tuneGrid=expand.grid(alpha=0,lambda=seq(0.001, 0.1, by = 0.001)))
+
+# previsioni ridge
+yhat_ridge = 10^predict(fit.ridge, newdata=test)
+
+# media previsioni lasso e previsioni ridge
+yhat_lasso.ridge=(yhat_lasso+yhat_ridge)/2
+
+# media pesata tra i due valori ottenuti, dando maggior peso alle previsioni più precise secondo la classifica parziale
+yhat=0.3*yhat_lasso.ridge+0.7*yhat_xgb
+
+# primi valori delle previsioni
+head(yhat)
+
+```
+
+
+
