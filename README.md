@@ -1,1 +1,1 @@
-# Data-Mining-Competitions
+# Data Mining Competitions
